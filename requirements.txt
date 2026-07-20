@@ -1,0 +1,18 @@
+# Core (no models) -- needed for discovery, paths, manifest, geometry, config, tests.
+numpy
+opencv-python
+Pillow
+pandas
+tqdm
+matplotlib
+
+# Models (Stage 2 super-resolution + Stage 3 depth). See README "Colab setup" for the
+# exact install order and the basicsr/torchvision workaround.
+torch
+torchvision
+transformers
+basicsr
+realesrgan
+
+# Testing
+pytest

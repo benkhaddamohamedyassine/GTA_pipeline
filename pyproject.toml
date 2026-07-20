@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crop_aerial_pipeline"
+version = "0.1.0"
+description = "Ground-level crop photos -> centered pseudo-aerial views, without diffusion."
+requires-python = ">=3.9"
+readme = "README.md"
+dependencies = [
+    "numpy",
+    "opencv-python",
+    "Pillow",
+    "pandas",
+    "tqdm",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+# Required for Stage 2 (super-resolution) and Stage 3 (depth). Kept optional at the
+# packaging level because both SUPER_RESOLUTION_ENABLED=False and a mocked/alternate
+# DepthEstimator can be used without them -- but the *default* PipelineConfig needs both,
+# so install this extra for a normal run.
+models = [
+    "torch",
+    "torchvision",
+    "transformers",
+    "basicsr",
+    "realesrgan",
+]
+dev = [
+    "pytest",
+]
+
+[project.scripts]
+crop-aerial-pipeline = "crop_aerial_pipeline.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["crop_aerial_pipeline*"]

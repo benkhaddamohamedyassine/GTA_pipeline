@@ -297,25 +297,34 @@ Covers, per the spec's required areas:
   `MAX_SUPER_RES_DIMENSION` let an unexpectedly large image through Stage 2 —
   lower it.
 
-### `ImportError` / `undefined symbol` from `basicsr` after installing a newer `torchvision`
+### `ModuleNotFoundError: No module named 'torchvision.transforms.functional_tensor'`
 
 `basicsr` (a `realesrgan` dependency) imports
 `torchvision.transforms.functional_tensor`, which was removed in
-`torchvision>=0.17`. If you see this error:
+`torchvision>=0.17` (its tensor-only implementations, e.g.
+`rgb_to_grayscale`, were merged into `torchvision.transforms.functional`,
+which still has the same names).
 
-```
-ModuleNotFoundError: No module named 'torchvision.transforms.functional_tensor'
-```
-
-the fix is either:
+**You shouldn't need to do anything about this** — `RealESRGANBackend.load()`
+patches it automatically (`models/super_resolution.py`,
+`_patch_torchvision_functional_tensor()`): it injects a small compatibility
+module into `sys.modules` the first time `basicsr`/`realesrgan` are imported,
+so this exact error is fixed transparently, on any torchvision version, with
+no pinning and no editing installed package files. If you still hit an
+`ImportError` from somewhere *else* inside `basicsr`'s dataset-loading code
+(it unconditionally imports its entire `data` subpackage on first import,
+which is more than this pipeline actually needs — a known fragility of that
+library, not something this shim can fully insulate you from), the immediate
+unblock is `PipelineConfig(SUPER_RESOLUTION_ENABLED=False)` while that gets
+sorted out; every other stage works identically either way. Manual fallbacks,
+if you ever need them:
 
 1. Pin an older `torchvision` before installing `basicsr`/`realesrgan`:
    ```bash
    pip install -q "torchvision<0.17"
    pip install -q basicsr realesrgan
    ```
-2. Or patch `basicsr` in place (works with any torchvision version) after
-   installing it:
+2. Or patch `basicsr` in place after installing it:
    ```python
    import basicsr, pathlib
    degradations_path = pathlib.Path(basicsr.__file__).parent / "data" / "degradations.py"

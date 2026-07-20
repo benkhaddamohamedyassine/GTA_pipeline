@@ -37,6 +37,41 @@ _MODEL_SPECS = {
 }
 
 
+def _patch_torchvision_functional_tensor() -> None:
+    """Compatibility shim for a well-known ``basicsr``/``realesrgan`` breakage:
+    they import ``torchvision.transforms.functional_tensor``, a module
+    torchvision removed in 0.17 (its tensor-only implementations, e.g.
+    ``rgb_to_grayscale``, were merged into ``torchvision.transforms.
+    functional``, which still exposes the same names). Rather than requiring
+    every user to pin an old torchvision or hand-patch basicsr's installed
+    files after every fresh install (fragile, easy to forget on a new Colab
+    runtime), inject a small compatibility module into ``sys.modules`` the
+    first time it's needed -- a no-op if the real module still exists (older
+    torchvision) or the shim was already installed this session.
+    """
+    import sys
+
+    if "torchvision.transforms.functional_tensor" in sys.modules:
+        return
+    try:
+        import torchvision.transforms.functional_tensor  # noqa: F401 -- exists (older torchvision); nothing to do
+
+        return
+    except ModuleNotFoundError:
+        pass
+
+    import types
+
+    import torchvision.transforms.functional as F
+
+    shim = types.ModuleType("torchvision.transforms.functional_tensor")
+    for name in dir(F):
+        if not name.startswith("_"):
+            setattr(shim, name, getattr(F, name))
+    sys.modules["torchvision.transforms.functional_tensor"] = shim
+    logger.info("Patched missing torchvision.transforms.functional_tensor (torchvision>=0.17 compatibility).")
+
+
 class SuperResolutionBackend(Protocol):
     def load(self) -> None: ...
 
@@ -103,6 +138,7 @@ class RealESRGANBackend:
     def load(self) -> None:
         if self._upsampler is not None:
             return
+        _patch_torchvision_functional_tensor()
         from basicsr.archs.rrdbnet_arch import RRDBNet
         from realesrgan import RealESRGANer
 

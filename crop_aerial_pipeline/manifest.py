@@ -16,17 +16,23 @@ import pandas as pd
 
 from .io.image_io import atomic_write_json, read_json
 
+# Must stay identical to ``stages.STAGE_ORDER`` (duplicated here, not imported
+# from there, to avoid a circular import: stages/__init__.py imports FROM this
+# module). tests/test_manifest_resume.py asserts the two stay in sync.
 STAGE_NAMES = [
     "validate",
-    "super_resolution",
-    "depth",
+    "initial_depth",
     "crop_mask",
-    "source_extension",
+    "ai_outpaint",
+    "extended_depth",
+    "extended_crop_mask",
     "backprojection",
     "camera",
+    "camera_fitting",
     "render",
     "fill",
-    "export",
+    "post_warp_super_resolution",
+    "finalize",
 ]
 
 STATUS_PENDING = "pending"

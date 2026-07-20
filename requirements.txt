@@ -6,13 +6,15 @@ pandas
 tqdm
 matplotlib
 
-# Models (Stage 2 super-resolution + Stage 3 depth). See README "Colab setup" for the
-# exact install order and the basicsr/torchvision workaround.
+# Models (Stage 2/5 depth, Stage 4 AI outpainting, Stage 12 post-warp super-resolution).
+# See README "Colab setup" for the exact install order and the basicsr/torchvision
+# compatibility note (handled automatically at runtime either way).
 torch
 torchvision
 transformers
 basicsr
 realesrgan
+simple-lama-inpainting
 
 # Testing
 pytest

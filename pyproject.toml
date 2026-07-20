@@ -18,16 +18,18 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Required for Stage 2 (super-resolution) and Stage 3 (depth). Kept optional at the
-# packaging level because both SUPER_RESOLUTION_ENABLED=False and a mocked/alternate
-# DepthEstimator can be used without them -- but the *default* PipelineConfig needs both,
-# so install this extra for a normal run.
+# Required for Stage 2/5 (depth), Stage 4 (AI outpainting), and Stage 12 (post-warp
+# super-resolution). Kept optional at the packaging level because AI_OUTPAINT_ENABLED=False
+# / POST_WARP_SUPER_RESOLUTION_ENABLED=False / a mocked DepthEstimator can be used without
+# them -- but the *default* PipelineConfig needs all three, so install this extra for a
+# normal run.
 models = [
     "torch",
     "torchvision",
     "transformers",
     "basicsr",
     "realesrgan",
+    "simple-lama-inpainting",
 ]
 dev = [
     "pytest",

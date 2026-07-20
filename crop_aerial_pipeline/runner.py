@@ -1,13 +1,23 @@
 """Top-level orchestration.
 
-``run_pipeline(input_folder)`` is the only thing most callers need: it
-discovers images, runs Stages 1-3 batch-wise (one model family resident on
-the GPU at a time), runs Stages 4-10 per-image (pure geometry/CV, no
-persistent model needed), keeps a resumable manifest up to date after every
-image, and returns a pandas summary.
+``run_pipeline(input_folder)`` is the only thing most callers need. Stage-wise
+batch execution keeps at most one model family resident on the GPU at a time:
 
-``process_single_image`` runs all ten stages for exactly one image -- handy
-for debugging a single file without a full batch run.
+    1  validate               (no model)
+    2  initial_depth          depth model  -> unload
+    3  crop_mask               (no model)
+    4  ai_outpaint             LaMa         -> unload
+    5  extended_depth          depth model  -> unload
+    6-11  extended_crop_mask, backprojection, camera, camera_fitting,
+          render, fill         (no model -- pure geometry/CV, per-image)
+    12 post_warp_super_resolution  Real-ESRGAN -> unload
+    13 finalize                (no model)
+
+Super-resolution runs ONLY at step 12, on the completed render -- never on
+the source photo (see ``models/super_resolution.py``'s module docstring).
+
+``process_single_image`` runs all thirteen stages for exactly one image,
+straight through (no stage-wise batching, since there's only one image).
 """
 
 from __future__ import annotations
@@ -28,15 +38,18 @@ from .manifest import STATUS_DONE, STATUS_FAILED, ImageRecord, Manifest
 from .models.model_manager import ModelManager
 from .stages import (
     stage01_validate,
-    stage02_super_resolution,
-    stage03_depth,
-    stage04_crop_mask,
-    stage05_source_extension,
-    stage06_backprojection,
-    stage07_camera,
-    stage08_render,
-    stage09_fill,
-    stage10_export,
+    stage02_initial_depth,
+    stage03_crop_mask,
+    stage04_ai_outpaint,
+    stage05_extended_depth,
+    stage06_extended_crop_mask,
+    stage07_backprojection,
+    stage08_camera,
+    stage09_camera_fitting,
+    stage10_render,
+    stage11_fill,
+    stage12_post_warp_super_resolution,
+    stage13_finalize,
 )
 from .utils import memory
 from .utils.hashing import file_fingerprint, fingerprints_match, hash_config
@@ -56,7 +69,9 @@ def run_pipeline(input_folder: str, config: Optional[PipelineConfig] = None) -> 
 
     logger = setup_logger(paths.logs_root, run_id)
     logger.info("run_pipeline starting: input_folder=%s run_id=%s recursive=%s", input_folder, run_id, config.RECURSIVE)
-    logger.info("Device: %s", ModelManager().device)
+
+    manager = ModelManager()
+    logger.info("Device: %s", manager.device)
 
     config_hash = hash_config(config)
     manifest = Manifest.load_or_create(paths.manifest_json_path()) if config.RESUME else Manifest()
@@ -67,83 +82,139 @@ def run_pipeline(input_folder: str, config: Optional[PipelineConfig] = None) -> 
         logger.warning("No supported images found -- nothing to do.")
         return manifest.to_dataframe()
 
-    manager = ModelManager()
     records = _prepare_records(manifest, paths, source_paths, config)
 
+    # --- Stage 1: validate (no model) ------------------------------------------------
     validated_by_key = _run_batch_stage(
-        "Stage 1/10: validate",
-        source_paths,
-        records,
+        "Stage 1/13: validate", source_paths, records,
         lambda source_path, relative_path, record: stage01_validate.run(
             source_path, relative_path, config, paths, record, config_hash, logger
         ),
-        manifest,
-        paths,
+        manifest, paths,
     )
 
-    sr_by_key = _run_batch_stage(
-        "Stage 2/10: super-resolution",
-        source_paths,
-        records,
-        lambda source_path, relative_path, record: stage02_super_resolution.run(
+    # --- Stage 2: initial depth (depth model) -----------------------------------------
+    initial_depth_by_key = _run_batch_stage(
+        "Stage 2/13: initial depth", source_paths, records,
+        lambda source_path, relative_path, record: stage02_initial_depth.run(
             validated_by_key[str(relative_path)], relative_path, config, paths, manager, record, config_hash, logger
-        )
-        if str(relative_path) in validated_by_key
-        else None,
-        manifest,
-        paths,
+        ) if str(relative_path) in validated_by_key else None,
+        manifest, paths,
     )
-    manager.unload(stage02_super_resolution.MODEL_KEY)
+    manager.unload(stage02_initial_depth.MODEL_KEY)
     memory.clear_memory()
 
-    depth_by_key = _run_batch_stage(
-        "Stage 3/10: depth",
-        source_paths,
-        records,
-        lambda source_path, relative_path, record: stage03_depth.run(
-            sr_by_key[str(relative_path)], relative_path, config, paths, manager, record, config_hash, logger
-        )
-        if str(relative_path) in sr_by_key
-        else None,
-        manifest,
-        paths,
+    # --- Stage 3: original crop mask + interior (no model) ------------------------------
+    crop_mask_by_key = _run_batch_stage(
+        "Stage 3/13: crop mask", source_paths, records,
+        lambda source_path, relative_path, record: stage03_crop_mask.run(
+            validated_by_key[str(relative_path)], relative_path, config, paths, record, config_hash, logger
+        ) if str(relative_path) in validated_by_key else None,
+        manifest, paths,
     )
-    manager.unload(stage03_depth.MODEL_KEY)
+
+    # --- Stage 4: AI outpainting (LaMa) ------------------------------------------------
+    outpaint_by_key = _run_batch_stage(
+        "Stage 4/13: AI outpaint", source_paths, records,
+        lambda source_path, relative_path, record: stage04_ai_outpaint.run(
+            validated_by_key[str(relative_path)], relative_path, config, paths, manager, record, config_hash, logger
+        ) if str(relative_path) in validated_by_key else None,
+        manifest, paths,
+    )
+    manager.unload(stage04_ai_outpaint.MODEL_KEY)
     memory.clear_memory()
 
+    # --- Stage 5: extended depth (depth model, reloaded) --------------------------------
+    extended_depth_by_key = _run_batch_stage(
+        "Stage 5/13: extended depth", source_paths, records,
+        lambda source_path, relative_path, record: stage05_extended_depth.run(
+            initial_depth_by_key[str(relative_path)], outpaint_by_key[str(relative_path)],
+            relative_path, config, paths, manager, record, config_hash, logger,
+        ) if str(relative_path) in initial_depth_by_key and str(relative_path) in outpaint_by_key else None,
+        manifest, paths,
+    )
+    manager.unload(stage05_extended_depth.MODEL_KEY)
+    memory.clear_memory()
+
+    # --- Stages 6-11: geometry + fill, per-image, no persistent model ------------------
+    fill_results_by_key: Dict[str, Any] = {}
+    render_by_key: Dict[str, Any] = {}
     failed_keys: List[str] = []
-    progress = tqdm(list(zip(source_paths, records)), desc="Stages 4-10/10: geometry + export")
+
+    progress = tqdm(list(zip(source_paths, records)), desc="Stages 6-11/13: geometry + fill")
     for source_path, record in progress:
         relative_path = paths.relative_path(source_path)
         key = str(relative_path)
-        progress.set_postfix(image=Path(key).name, device=manager.device, mem=memory.cuda_memory_summary())
+        progress.set_postfix(image=Path(key).name, device=manager.device)
 
-        validated = validated_by_key.get(key)
-        sr_rgb = sr_by_key.get(key)
-        depth_norm = depth_by_key.get(key)
-        if validated is None or sr_rgb is None or depth_norm is None:
+        crop_mask = crop_mask_by_key.get(key)
+        outpaint = outpaint_by_key.get(key)
+        extended_depth = extended_depth_by_key.get(key)
+        if crop_mask is None or outpaint is None or extended_depth is None:
             failed_keys.append(key)
             manifest.save(paths.manifest_json_path(), paths.manifest_csv_path())
             continue
 
         try:
-            _run_geometry_and_export(
-                validated, sr_rgb, depth_norm, relative_path, config, paths, record, config_hash, logger
+            fill_result, render = _run_geometry_stages(
+                crop_mask, outpaint, extended_depth, relative_path, config, paths, record, config_hash, logger
             )
-            record.overall_status = STATUS_DONE
-            record.total_runtime_seconds = sum(s.runtime_seconds for s in record.stages.values())
-        except Exception as exc:  # noqa: BLE001 -- one image's failure must not stop the batch
+            fill_results_by_key[key] = fill_result
+            render_by_key[key] = render
+        except Exception as exc:  # noqa: BLE001
             record.overall_status = STATUS_FAILED
             record.error = record.error or f"{type(exc).__name__}: {exc}"
             failed_keys.append(key)
-            logger.error("Image failed: %s (%s)", key, record.error)
+            logger.error("Image failed in geometry stages: %s (%s)", key, record.error)
             if not config.CONTINUE_ON_ERROR:
                 manifest.save(paths.manifest_json_path(), paths.manifest_csv_path())
                 raise
         finally:
             manifest.save(paths.manifest_json_path(), paths.manifest_csv_path())
 
-    manager.unload_all()
+    # --- Stage 12: post-warp super-resolution (Real-ESRGAN) -----------------------------
+    sr_by_key = _run_batch_stage(
+        "Stage 12/13: post-warp super-resolution", source_paths, records,
+        lambda source_path, relative_path, record: stage12_post_warp_super_resolution.run(
+            fill_results_by_key[str(relative_path)], render_by_key[str(relative_path)],
+            relative_path, config, paths, manager, record, config_hash, logger,
+        ) if str(relative_path) in fill_results_by_key else None,
+        manifest, paths,
+    )
+    manager.unload(stage12_post_warp_super_resolution.MODEL_KEY)
+    memory.clear_memory()
+
+    # --- Stage 13: conservative finalization (no model) ---------------------------------
+    progress = tqdm(list(zip(source_paths, records)), desc="Stage 13/13: finalize")
+    for source_path, record in progress:
+        relative_path = paths.relative_path(source_path)
+        key = str(relative_path)
+        if key not in sr_by_key:
+            if key not in failed_keys:
+                failed_keys.append(key)
+            manifest.save(paths.manifest_json_path(), paths.manifest_csv_path())
+            continue
+
+        try:
+            final_path = stage13_finalize.run(
+                validated_by_key[key], fill_results_by_key[key], sr_by_key[key],
+                relative_path, config, paths, record, config_hash, logger,
+            )
+            if final_path is None:
+                raise RuntimeError(record.error or "finalize stage failed")
+            record.overall_status = STATUS_DONE
+            record.total_runtime_seconds = sum(s.runtime_seconds for s in record.stages.values())
+        except Exception as exc:  # noqa: BLE001
+            record.overall_status = STATUS_FAILED
+            record.error = record.error or f"{type(exc).__name__}: {exc}"
+            if key not in failed_keys:
+                failed_keys.append(key)
+            logger.error("Image failed: %s (%s)", key, record.error)
+            if not config.CONTINUE_ON_ERROR:
+                manifest.save(paths.manifest_json_path(), paths.manifest_csv_path())
+                raise
+        finally:
+            manifest.save(paths.manifest_json_path(), paths.manifest_csv_path())
 
     if failed_keys:
         logger.warning("Batch complete with %d failed image(s):", len(failed_keys))
@@ -159,10 +230,10 @@ def run_pipeline(input_folder: str, config: Optional[PipelineConfig] = None) -> 
 
 
 def process_single_image(image_path: str, config: PipelineConfig, paths: PipelinePaths) -> ImageProcessingResult:
-    """Runs all ten stages for exactly one image (not batch-optimized -- both
-    SR and depth models load/unload around this single image). Participates
-    in the same manifest as a full ``run_pipeline`` run at the same ``paths``,
-    so it's resumable/inspectable the same way.
+    """Runs all thirteen stages for exactly one image, straight through (not
+    stage-wise batched). Participates in the same manifest as a full
+    ``run_pipeline`` run at the same ``paths``, so it's resumable/inspectable
+    the same way.
     """
     config.validate()
     paths.ensure_directories()
@@ -182,17 +253,44 @@ def process_single_image(image_path: str, config: PipelineConfig, paths: Pipelin
         if validated is None:
             return record
 
-        sr_rgb = stage02_super_resolution.run(validated, relative_path, config, paths, manager, record, config_hash, logger)
-        manager.unload(stage02_super_resolution.MODEL_KEY)
-        if sr_rgb is None:
+        initial_depth = stage02_initial_depth.run(validated, relative_path, config, paths, manager, record, config_hash, logger)
+        manager.unload(stage02_initial_depth.MODEL_KEY)
+        if initial_depth is None:
             return record
 
-        depth_norm = stage03_depth.run(sr_rgb, relative_path, config, paths, manager, record, config_hash, logger)
-        manager.unload(stage03_depth.MODEL_KEY)
-        if depth_norm is None:
+        crop_mask = stage03_crop_mask.run(validated, relative_path, config, paths, record, config_hash, logger)
+        if crop_mask is None:
             return record
 
-        _run_geometry_and_export(validated, sr_rgb, depth_norm, relative_path, config, paths, record, config_hash, logger)
+        outpaint = stage04_ai_outpaint.run(validated, relative_path, config, paths, manager, record, config_hash, logger)
+        manager.unload(stage04_ai_outpaint.MODEL_KEY)
+        if outpaint is None:
+            return record
+
+        extended_depth = stage05_extended_depth.run(
+            initial_depth, outpaint, relative_path, config, paths, manager, record, config_hash, logger
+        )
+        manager.unload(stage05_extended_depth.MODEL_KEY)
+        if extended_depth is None:
+            return record
+
+        fill_result, render = _run_geometry_stages(
+            crop_mask, outpaint, extended_depth, relative_path, config, paths, record, config_hash, logger
+        )
+
+        sr_output = stage12_post_warp_super_resolution.run(
+            fill_result, render, relative_path, config, paths, manager, record, config_hash, logger
+        )
+        manager.unload(stage12_post_warp_super_resolution.MODEL_KEY)
+        if sr_output is None:
+            return record
+
+        final_path = stage13_finalize.run(
+            validated, fill_result, sr_output, relative_path, config, paths, record, config_hash, logger
+        )
+        if final_path is None:
+            raise RuntimeError(record.error or "finalize stage failed")
+
         record.overall_status = STATUS_DONE
         record.total_runtime_seconds = sum(s.runtime_seconds for s in record.stages.values())
     except Exception as exc:  # noqa: BLE001
@@ -251,11 +349,6 @@ def _prepare_records(
         fingerprint = file_fingerprint(source_path)
         record = manifest.get_or_create(relative_path)
         if not fingerprints_match(record.source_hash, fingerprint):
-            # New file, or its content changed since the last run -- cached stage outputs
-            # (if any) are no longer trustworthy; should_skip_stage() will notice the
-            # config/upstream checks still pass but callers re-fingerprinting here is what
-            # ultimately forces stage 1 to actually re-run (its own output won't match this
-            # new hash), which then invalidates every downstream stage via mark_done().
             record.source_hash = fingerprint
         records.append(record)
     return records
@@ -272,47 +365,53 @@ def _run_batch_stage(desc: str, source_paths, records, stage_fn, manifest: Manif
     return results
 
 
-def _run_geometry_and_export(
-    validated,
-    sr_rgb,
-    depth_norm,
+def _run_geometry_stages(
+    crop_mask,
+    outpaint,
+    extended_depth,
     relative_path: Path,
     config: PipelineConfig,
     paths: PipelinePaths,
     record: ImageRecord,
     config_hash: str,
     logger: logging.Logger,
-) -> None:
-    crop_mask_out = stage04_crop_mask.run(sr_rgb, relative_path, config, paths, record, config_hash, logger)
-    if crop_mask_out is None:
-        raise RuntimeError(record.error or "crop_mask stage failed")
-
-    source_ext = stage05_source_extension.run(
-        sr_rgb, depth_norm, crop_mask_out, relative_path, config, paths, record, config_hash, logger
+):
+    """Stages 6-11: re-segment the extended canvas, back-project, place +
+    fit the virtual camera (using only original crop-interior points),
+    render, and fill small residual holes. Raises on any stage failure so
+    the caller's try/except can mark the image failed without stopping the
+    batch (Stage 4's ``CONTINUE_ON_ERROR`` behavior).
+    """
+    extended_crop_mask = stage06_extended_crop_mask.run(
+        crop_mask, outpaint, relative_path, config, paths, record, config_hash, logger
     )
-    if source_ext is None:
-        raise RuntimeError(record.error or "source_extension stage failed")
+    if extended_crop_mask is None:
+        raise RuntimeError(record.error or "extended_crop_mask stage failed")
 
-    backprojection = stage06_backprojection.run(source_ext, relative_path, config, paths, record, config_hash, logger)
+    backprojection = stage07_backprojection.run(
+        outpaint, extended_depth, crop_mask, extended_crop_mask, relative_path, config, paths, record, config_hash, logger
+    )
     if backprojection is None:
         raise RuntimeError(record.error or "backprojection stage failed")
 
-    camera = stage07_camera.run(backprojection, source_ext, relative_path, config, paths, record, config_hash, logger)
+    camera = stage08_camera.run(backprojection, relative_path, config, paths, record, config_hash, logger)
     if camera is None:
         raise RuntimeError(record.error or "camera stage failed")
 
-    render = stage08_render.run(
-        backprojection, source_ext, camera, relative_path, config, paths, record, config_hash, logger
+    camera_fitting = stage09_camera_fitting.run(
+        backprojection, camera, relative_path, config, paths, record, config_hash, logger
+    )
+    if camera_fitting is None:
+        raise RuntimeError(record.error or "camera_fitting stage failed")
+
+    render = stage10_render.run(
+        backprojection, camera, camera_fitting, relative_path, config, paths, record, config_hash, logger
     )
     if render is None:
         raise RuntimeError(record.error or "render stage failed")
 
-    fill_result = stage09_fill.run(render, relative_path, config, paths, record, config_hash, logger)
+    fill_result = stage11_fill.run(render, relative_path, config, paths, record, config_hash, logger)
     if fill_result is None:
         raise RuntimeError(record.error or "fill stage failed")
 
-    final_path = stage10_export.run(
-        validated, sr_rgb, fill_result, relative_path, config, paths, record, config_hash, logger
-    )
-    if final_path is None:
-        raise RuntimeError(record.error or "export stage failed")
+    return fill_result, render

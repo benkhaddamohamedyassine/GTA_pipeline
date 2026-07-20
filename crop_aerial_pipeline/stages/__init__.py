@@ -1,5 +1,5 @@
-"""Ten small, single-responsibility stage modules (``stage01_validate`` ...
-``stage10_export``). Each exposes one ``run(...)`` function that:
+"""Thirteen small, single-responsibility stage modules (``stage01_validate``
+... ``stage13_finalize``). Each exposes one ``run(...)`` function that:
 
 1. Decides (via :func:`should_skip_stage` below) whether a valid cached output
    already exists and can be loaded instead of recomputed.
@@ -8,8 +8,15 @@
 4. Returns the data the *next* stage needs (not just a boolean) -- so a
    skipped stage is exactly as useful to its caller as a freshly-computed one.
 
-This module holds the small amount of bookkeeping logic shared by all ten
-stages, so each stage file only contains its own domain logic.
+This module holds the small amount of bookkeeping logic shared by all
+thirteen stages, so each stage file only contains its own domain logic.
+
+REVISED ORDER: depth/crop-mask run once on the original image (2-3), AI
+outpainting extends the canvas (4), depth/crop-mask then re-run on the
+*extended* image (5-6), geometry uses the extended data but centers the
+camera using only original-image points (7-9), rendering + hole-filling
+happen next (10-11), and only THEN does super-resolution run, on the
+completed render (12) -- never on the source photo.
 """
 
 from __future__ import annotations
@@ -22,15 +29,18 @@ from ..manifest import STATUS_DONE, STATUS_FAILED, STATUS_PENDING, STATUS_SKIPPE
 
 STAGE_ORDER = [
     "validate",
-    "super_resolution",
-    "depth",
+    "initial_depth",
     "crop_mask",
-    "source_extension",
+    "ai_outpaint",
+    "extended_depth",
+    "extended_crop_mask",
     "backprojection",
     "camera",
+    "camera_fitting",
     "render",
     "fill",
-    "export",
+    "post_warp_super_resolution",
+    "finalize",
 ]
 
 

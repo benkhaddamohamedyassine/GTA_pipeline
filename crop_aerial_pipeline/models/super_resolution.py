@@ -1,9 +1,17 @@
-"""Conservative super-resolution: sharpens/upsamples the source photo before
-depth estimation and geometric warping, WITHOUT inventing content -- no
-prompt-based generation, no face/anime-specific weights, no diffusion. Real-
-ESRGAN's x2plus weights are trained purely for photorealistic upsampling and
-denoising, not generation, which is why it's the default here instead of any
-diffusion-based upscaler.
+"""Post-warp super-resolution: sharpens/upsamples the COMPLETED pseudo-aerial
+render (Stage 11's hole-filled output), never the source photo.
+
+This is a deliberate ordering choice (see ``stages/stage12_post_warp_super_
+resolution.py`` for the full reasoning): upscaling the source image before
+depth estimation and back-projection added memory cost without adding real
+geometric information, could amplify foliage detail into unstable monocular
+depth, and risked super-resolution artifacts leaking into crop segmentation,
+depth, camera placement, or point-cloud reconstruction. Running it after
+warping avoids all of that while still sharpening the final image.
+
+WITHOUT inventing content -- no prompt-based generation, no face/anime-
+specific weights, no diffusion. Real-ESRGAN's x2plus weights are trained
+purely for photorealistic upsampling and denoising, not generation.
 """
 
 from __future__ import annotations
@@ -21,8 +29,8 @@ logger = logging.getLogger("crop_aerial_pipeline")
 
 # (netscale, download url) per supported model -- deliberately a short, explicit
 # allowlist rather than accepting an arbitrary model name/path, so a typo'd
-# SUPER_RESOLUTION_MODEL fails fast with a clear message instead of a weird
-# runtime error deep inside basicsr.
+# POST_WARP_SUPER_RESOLUTION_MODEL fails fast with a clear message instead of
+# a weird runtime error deep inside basicsr.
 _MODEL_SPECS = {
     "RealESRGAN_x2plus": {
         "netscale": 2,
@@ -44,10 +52,10 @@ def _patch_torchvision_functional_tensor() -> None:
     ``rgb_to_grayscale``, were merged into ``torchvision.transforms.
     functional``, which still exposes the same names). Rather than requiring
     every user to pin an old torchvision or hand-patch basicsr's installed
-    files after every fresh install (fragile, easy to forget on a new Colab
-    runtime), inject a small compatibility module into ``sys.modules`` the
-    first time it's needed -- a no-op if the real module still exists (older
-    torchvision) or the shim was already installed this session.
+    files after every fresh install, inject a small compatibility module into
+    ``sys.modules`` the first time it's needed -- a no-op if the real module
+    still exists (older torchvision) or the shim was already installed this
+    session.
     """
     import sys
 
@@ -72,7 +80,7 @@ def _patch_torchvision_functional_tensor() -> None:
     logger.info("Patched missing torchvision.transforms.functional_tensor (torchvision>=0.17 compatibility).")
 
 
-class SuperResolutionBackend(Protocol):
+class PostWarpSuperResolutionBackend(Protocol):
     def load(self) -> None: ...
 
     def upscale(self, image: np.ndarray, scale: float) -> np.ndarray: ...
@@ -81,29 +89,32 @@ class SuperResolutionBackend(Protocol):
 
 
 @dataclass
-class SuperResolutionRunInfo:
+class PostWarpSuperResolutionRunInfo:
     input_width: int
     input_height: int
     output_width: int
     output_height: int
+    requested_scale: float
     effective_scale: float
     tile_size: int
+    retry_count: int
     runtime_seconds: float
     device: str
     model_name: str
+    used_cpu_fallback: bool
 
 
 def compute_effective_scale(width: int, height: int, requested_scale: float, max_dimension: int) -> float:
     """Caps the requested scale so ``max(width, height) * scale`` never
-    exceeds ``max_dimension`` -- large phone photos at 2x-4x can otherwise
-    produce enormous images that blow the memory budget of every later stage.
+    exceeds ``max_dimension``, preserving aspect ratio (a single uniform
+    scale factor is applied to both axes either way).
     """
     longest_side = max(width, height)
     if longest_side * requested_scale <= max_dimension:
         return requested_scale
     capped = max_dimension / longest_side
     logger.info(
-        "Capping super-resolution scale %.2fx -> %.2fx to keep the longest side <= %d px",
+        "Capping post-warp super-resolution scale %.2fx -> %.2fx to keep the longest side <= %d px",
         requested_scale,
         capped,
         max_dimension,
@@ -111,11 +122,11 @@ def compute_effective_scale(width: int, height: int, requested_scale: float, max
     return max(1.0, capped)
 
 
-class RealESRGANBackend:
+class RealESRGANPostWarpBackend:
     """Real-ESRGAN backend using the official ``realesrgan``/``basicsr``
     packages. See the package README's troubleshooting section for the known
-    ``torchvision.transforms.functional_tensor`` import error on newer
-    torchvision versions and how to work around it.
+    ``torchvision.transforms.functional_tensor`` compatibility note (handled
+    automatically by this class -- see ``_patch_torchvision_functional_tensor``).
     """
 
     def __init__(
@@ -124,16 +135,22 @@ class RealESRGANBackend:
         tile: int = 256,
         tile_pad: int = 16,
         half_precision: bool = True,
+        fallback_cpu: bool = True,
         device: Optional[str] = None,
     ) -> None:
         if model_name not in _MODEL_SPECS:
-            raise ValueError(f"Unknown SUPER_RESOLUTION_MODEL {model_name!r}; supported: {list(_MODEL_SPECS)}")
+            raise ValueError(
+                f"Unknown POST_WARP_SUPER_RESOLUTION_MODEL {model_name!r}; supported: {list(_MODEL_SPECS)}"
+            )
         self.model_name = model_name
         self.tile = tile
         self.tile_pad = tile_pad
         self.half_precision = half_precision
+        self.fallback_cpu = fallback_cpu
         self.device = device or ("cuda" if memory.is_cuda_available() else "cpu")
         self._upsampler = None
+        self.last_retry_count = 0
+        self.used_cpu_fallback = False
 
     def load(self) -> None:
         if self._upsampler is not None:
@@ -160,21 +177,25 @@ class RealESRGANBackend:
     def upscale(self, image: np.ndarray, scale: float) -> np.ndarray:
         self.load()
         bgr = np.ascontiguousarray(image[:, :, ::-1])  # RealESRGANer follows cv2's BGR convention
+        self.last_retry_count = 0
+        self.used_cpu_fallback = False
 
         def _run() -> np.ndarray:
             output_bgr, _ = self._upsampler.enhance(bgr, outscale=scale)
             return output_bgr
 
         def _on_oom(_attempt: int) -> None:
+            self.last_retry_count += 1
             self._upsampler.tile = max(64, self._upsampler.tile // 2)
             logger.warning("CUDA OOM in Real-ESRGAN -- reduced tile size to %d", self._upsampler.tile)
 
         try:
             output_bgr = memory.retry_on_cuda_oom(_run, on_oom=_on_oom, max_retries=3)
         except Exception as exc:
-            if memory.is_cuda_oom_error(exc) and self.device == "cuda":
+            if memory.is_cuda_oom_error(exc) and self.device == "cuda" and self.fallback_cpu:
                 logger.warning("Repeated CUDA OOM in Real-ESRGAN -- falling back to CPU for this image.")
                 self.device = "cpu"
+                self.used_cpu_fallback = True
                 self.unload()
                 self.load()
                 output_bgr, _ = self._upsampler.enhance(bgr, outscale=scale)
@@ -188,15 +209,15 @@ class RealESRGANBackend:
         memory.clear_memory()
 
 
-def run_super_resolution(
-    backend: SuperResolutionBackend,
+def run_post_warp_super_resolution(
+    backend: PostWarpSuperResolutionBackend,
     image: np.ndarray,
     requested_scale: float,
     max_dimension: int,
     model_name: str,
     tile: int,
     device: str,
-) -> tuple[np.ndarray, SuperResolutionRunInfo]:
+) -> tuple[np.ndarray, PostWarpSuperResolutionRunInfo]:
     h, w = image.shape[:2]
     effective_scale = compute_effective_scale(w, h, requested_scale, max_dimension)
 
@@ -204,15 +225,18 @@ def run_super_resolution(
     output = backend.upscale(image, effective_scale)
     runtime = time.perf_counter() - start
 
-    info = SuperResolutionRunInfo(
+    info = PostWarpSuperResolutionRunInfo(
         input_width=w,
         input_height=h,
         output_width=output.shape[1],
         output_height=output.shape[0],
+        requested_scale=requested_scale,
         effective_scale=effective_scale,
         tile_size=tile,
+        retry_count=getattr(backend, "last_retry_count", 0),
         runtime_seconds=runtime,
         device=device,
         model_name=model_name,
+        used_cpu_fallback=getattr(backend, "used_cpu_fallback", False),
     )
     return output, info

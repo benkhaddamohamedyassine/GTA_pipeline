@@ -41,35 +41,42 @@ def select_interior_points(
     is_original: np.ndarray,
     in_crop_interior: np.ndarray,
     in_crop_mask: Optional[np.ndarray] = None,
+    is_finite: Optional[np.ndarray] = None,
     min_points_interior: int = 50,
     min_points_fallback: int = 10,
 ) -> Tuple[np.ndarray, str]:
     """The selection logic shared by ``robust_crop_center`` (for the center
-    itself) and Stage 8's auto-zoom fitting (which needs the same selected
+    itself) and Stage 9's auto-zoom fitting (which needs the same selected
     points, transformed into camera space). Two-tier fallback if too few
     interior points survive the strict filter:
 
-      1. crop-interior AND original (preferred)
-      2. full crop-mask AND original (if too few interior points)
-      3. any original point (if the crop mask itself was too sparse)
+      1. crop-interior AND original AND finite (preferred)
+      2. full crop-mask AND original AND finite (if too few interior points)
+      3. any original AND finite point (if the crop mask itself was too sparse)
+
+    ``is_finite`` (all points satisfy "have finite valid geometry" -- see
+    Stage 8) is ANDed into every tier; it defaults to all-True if omitted.
 
     Returns ``(selected_points, fallback_used)``.
     """
-    selector = is_original & in_crop_interior
+    if is_finite is None:
+        is_finite = np.ones(points.shape[0], dtype=bool)
+
+    selector = is_original & in_crop_interior & is_finite
     fallback_used = "interior"
 
     if selector.sum() < min_points_interior and in_crop_mask is not None:
-        selector = is_original & in_crop_mask
+        selector = is_original & in_crop_mask & is_finite
         fallback_used = "full_crop_mask"
 
     if selector.sum() < min_points_fallback:
-        selector = is_original
+        selector = is_original & is_finite
         fallback_used = "original_region"
 
     if selector.sum() == 0:
         raise ValueError(
-            "No original (non-synthesized) points available to compute a crop center -- "
-            "the source image likely produced an empty/degenerate point cloud."
+            "No original (non-synthesized), finite-geometry points available to compute a "
+            "crop center -- the source image likely produced an empty/degenerate point cloud."
         )
 
     return points[selector], fallback_used
@@ -80,6 +87,7 @@ def robust_crop_center(
     is_original: np.ndarray,
     in_crop_interior: np.ndarray,
     in_crop_mask: Optional[np.ndarray] = None,
+    is_finite: Optional[np.ndarray] = None,
     min_points_interior: int = 50,
     min_points_fallback: int = 10,
     canopy_quantile: float = 0.9,
@@ -89,7 +97,7 @@ def robust_crop_center(
     :func:`select_interior_points` for the fallback tiers.
     """
     selected, fallback_used = select_interior_points(
-        points, is_original, in_crop_interior, in_crop_mask, min_points_interior, min_points_fallback
+        points, is_original, in_crop_interior, in_crop_mask, is_finite, min_points_interior, min_points_fallback
     )
     center_x = float(np.median(selected[:, 0]))
     center_z = float(np.median(selected[:, 2]))

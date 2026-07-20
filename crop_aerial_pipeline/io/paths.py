@@ -10,15 +10,31 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+# Matches the "REVISED TEMPORARY OUTPUT STRUCTURE" spec exactly. A few outputs
+# mentioned in individual stage descriptions but not in that canonical list
+# (Stage 2/5's raw depth .npy, Stage 9's virtual intrinsics, Stage 10's render
+# depth preview) are sidecars nested inside the nearest listed folder via
+# ``sidecar_path()`` rather than new top-level directories -- see each stage
+# module's docstring for exactly where.
 STAGE_DIR_NAMES = [
     "01_validated",
-    "02_super_resolution",
-    "03_depth_preview",
-    "04_crop_mask",
-    "05_source_extended",
-    "06_raw_render",
-    "07_validity_mask",
-    "08_filled_render",
+    "02_initial_depth_preview",
+    "03_crop_mask",
+    "03_crop_interior",
+    "04_ai_outpaint",
+    "04_ai_outpaint_mask",
+    "04_ai_outpaint_provenance",
+    "05_extended_depth_preview",
+    "06_extended_crop_mask",
+    "07_point_cloud",
+    "08_camera",
+    "10_raw_warp",
+    "10_validity_mask",
+    "10_render_provenance",
+    "11_filled_warp",
+    "11_filled_mask",
+    "12_super_resolved_warp",
+    "13_finalized",
 ]
 
 TEMP_DIR_NAME = "_crop_aerial_temp"

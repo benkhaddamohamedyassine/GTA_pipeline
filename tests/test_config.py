@@ -12,14 +12,16 @@ def test_default_config_is_valid():
 @pytest.mark.parametrize(
     "field, value",
     [
-        ("SUPER_RESOLUTION_SCALE", 1.0),  # must be > 1.0
-        ("SUPER_RESOLUTION_TILE", 0),
+        ("POST_WARP_SUPER_RESOLUTION_SCALE", 1.0),  # must be > 1.0
+        ("POST_WARP_SUPER_RESOLUTION_TILE", 0),
         ("ALTITUDE_M", 0.0),
         ("ALTITUDE_M", -5.0),
         ("TILT_DEGREES", 90.0),
         ("TILT_DEGREES", -1.0),
-        ("SOURCE_PAD_FRAC", -0.1),
-        ("SOURCE_EXTENSION_MODE", "mirror_everything"),
+        ("AI_OUTPAINT_PAD_FRAC", -0.1),
+        ("AI_OUTPAINT_BACKEND", "mirror_everything"),
+        ("AI_OUTPAINT_STEP_FRAC", 0.0),
+        ("AI_OUTPAINT_STEP_FRAC", 1.5),
         ("CROP_INTERIOR_QUANTILE", 0.0),
         ("CROP_INTERIOR_QUANTILE", 1.5),
         ("CAMERA_FRAME_FILL", 0.0),

@@ -1,6 +1,13 @@
-"""Stage 7 -- places the virtual camera above the crop *interior* (never the
-padded/synthesized geometry, never the whole point cloud's centroid or
-extremes). Defaults to a true vertical (nadir) view.
+"""Stage 8 -- places the virtual camera above the ORIGINAL crop interior.
+Only points that (a) originated in the real original image, (b) belong to
+the original crop mask, (c) belong to the original crop-interior selection,
+and (d) have finite valid geometry may influence camera X/Z/target -- all
+four conditions are already baked into ``BackprojectionResult.in_crop_interior``/
+``is_original``/``is_finite`` by Stage 7, and (b) is automatically satisfied
+too: Stage 6 hard-pastes the original crop mask into the extended mask
+inside exactly the region where ``is_original`` is True, so the two
+conditions coincide there by construction. Defaults to a true vertical
+(nadir) view.
 """
 
 from __future__ import annotations
@@ -14,11 +21,9 @@ from typing import Optional
 import numpy as np
 
 from . import mark_done, mark_failed, mark_running, mark_skipped, should_skip_stage
-from .stage05_source_extension import SourceExtensionOutput
-from .stage06_backprojection import BackprojectionResult
+from .stage07_backprojection import BackprojectionResult
 from ..config import PipelineConfig
-from ..geometry.backprojection import sample_mask_at_stride
-from ..geometry.crop_center import CropCenterResult, compute_interior_selector, robust_crop_center
+from ..geometry.crop_center import CropCenterResult, robust_crop_center
 from ..geometry.virtual_camera import VirtualCameraPose, place_camera
 from ..io.image_io import atomic_write_json, read_json
 from ..io.paths import PipelinePaths
@@ -35,7 +40,6 @@ class CameraOutput:
 
 def run(
     backprojection: BackprojectionResult,
-    source_ext: SourceExtensionOutput,
     relative_path: Path,
     config: PipelineConfig,
     paths: PipelinePaths,
@@ -43,7 +47,7 @@ def run(
     config_hash: str,
     logger: logging.Logger,
 ) -> Optional[CameraOutput]:
-    camera_path = paths.sidecar_path("06_raw_render", relative_path, ".camera.json")
+    camera_path = paths.sidecar_path("08_camera", relative_path, ".camera.json")
 
     if should_skip_stage(record, STAGE_NAME, [camera_path], config_hash, config.RESUME, config.OVERWRITE):
         mark_skipped(record, STAGE_NAME)
@@ -68,15 +72,12 @@ def run(
     mark_running(record, STAGE_NAME)
     start = time.perf_counter()
     try:
-        h, w = source_ext.extended.rgb.shape[:2]
-        interior_selector = compute_interior_selector(source_ext.extended.crop_mask, config.CROP_INTERIOR_QUANTILE)
-        in_crop_interior = sample_mask_at_stride(interior_selector, h, w, config.BACKPROJECT_STRIDE)
-
         crop_center = robust_crop_center(
             points=backprojection.points,
             is_original=backprojection.is_original,
-            in_crop_interior=in_crop_interior,
+            in_crop_interior=backprojection.in_crop_interior,
             in_crop_mask=backprojection.in_crop_mask,
+            is_finite=backprojection.is_finite,
         )
         pose = place_camera(
             center_x=crop_center.center_x,

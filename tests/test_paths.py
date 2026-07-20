@@ -20,8 +20,11 @@ def test_required_directories_are_created_beside_input_folder(sample_folder: Pat
     assert paths.results_root.is_dir()
     assert paths.logs_root.is_dir()
     for stage_name in [
-        "01_validated", "02_super_resolution", "03_depth_preview", "04_crop_mask",
-        "05_source_extended", "06_raw_render", "07_validity_mask", "08_filled_render",
+        "01_validated", "02_initial_depth_preview", "03_crop_mask", "03_crop_interior",
+        "04_ai_outpaint", "04_ai_outpaint_mask", "04_ai_outpaint_provenance",
+        "05_extended_depth_preview", "06_extended_crop_mask", "07_point_cloud", "08_camera",
+        "10_raw_warp", "10_validity_mask", "10_render_provenance",
+        "11_filled_warp", "11_filled_mask", "12_super_resolved_warp", "13_finalized",
     ]:
         assert (paths.run_dir / stage_name).is_dir()
 
@@ -36,22 +39,22 @@ def test_stage_output_path_preserves_basename_and_subdirectory(sample_folder: Pa
     paths = _paths_for(sample_folder)
     relative = Path("farm_2/field_b.png")
 
-    out = paths.stage_output_path("02_super_resolution", relative)
-    assert out == paths.run_dir / "02_super_resolution" / "farm_2" / "field_b.png"
+    out = paths.stage_output_path("04_ai_outpaint", relative)
+    assert out == paths.run_dir / "04_ai_outpaint" / "farm_2" / "field_b.png"
     assert out.name == "field_b.png"  # exact original basename preserved
 
 
 def test_stage_output_path_extension_override_keeps_stem(sample_folder: Path):
     paths = _paths_for(sample_folder)
-    out = paths.stage_output_path("04_crop_mask", Path("field_a.jpg"), ext_override=".png")
+    out = paths.stage_output_path("03_crop_mask", Path("field_a.jpg"), ext_override=".png")
     assert out.stem == "field_a"
     assert out.suffix == ".png"
 
 
 def test_sidecar_path_keeps_stem_and_subdirectory(sample_folder: Path):
     paths = _paths_for(sample_folder)
-    sidecar = paths.sidecar_path("03_depth_preview", Path("farm_2/field_b.png"), ".depth.npy")
-    assert sidecar == paths.run_dir / "03_depth_preview" / "farm_2" / "field_b.depth.npy"
+    sidecar = paths.sidecar_path("02_initial_depth_preview", Path("farm_2/field_b.png"), ".depth.npy")
+    assert sidecar == paths.run_dir / "02_initial_depth_preview" / "farm_2" / "field_b.depth.npy"
 
 
 def test_results_output_path_mirrors_relative_structure(sample_folder: Path):

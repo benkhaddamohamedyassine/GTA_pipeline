@@ -5,7 +5,9 @@ from pathlib import Path
 import pytest
 
 from crop_aerial_pipeline.config import PipelineConfig
+from crop_aerial_pipeline import manifest as manifest_module
 from crop_aerial_pipeline.manifest import STATUS_DONE, STATUS_FAILED, STATUS_PENDING, Manifest
+from crop_aerial_pipeline import stages as stages_module
 from crop_aerial_pipeline.stages import mark_done, mark_failed, mark_skipped, should_skip_stage
 from crop_aerial_pipeline.utils.hashing import fingerprints_match, hash_config, hash_file_content
 
@@ -13,6 +15,17 @@ from crop_aerial_pipeline.utils.hashing import fingerprints_match, hash_config, 
 def _touch(path: Path, content: bytes = b"abc") -> Path:
     path.write_bytes(content)
     return path
+
+
+def test_manifest_stage_names_match_stage_order():
+    """Regression guard: manifest.STAGE_NAMES (used to seed each ImageRecord's
+    default per-stage dict) is a duplicate of stages.STAGE_ORDER, kept
+    separate only to avoid a circular import. A real bug shipped once where
+    these drifted apart (STAGE_NAMES still listed a removed stage), which
+    silently left every ImageRecord with an extra, permanently-'pending'
+    stage entry -- this test fails loudly if that happens again.
+    """
+    assert manifest_module.STAGE_NAMES == stages_module.STAGE_ORDER
 
 
 def test_should_skip_stage_requires_prior_success(tmp_path: Path):
@@ -56,9 +69,9 @@ def test_should_skip_stage_false_when_upstream_not_done(tmp_path: Path):
     record = manifest.get_or_create(Path("field_a.jpg"))
     output = _touch(tmp_path / "out.jpg")
 
-    # "depth" (stage 3) claims done, but "validate"/"super_resolution" (stages 1-2) never ran.
-    mark_done(record, "depth", runtime_seconds=1.0, config_hash="hash1")
-    assert not should_skip_stage(record, "depth", [output], "hash1", resume=True, overwrite=False)
+    # "crop_mask" (stage 3) claims done, but "validate"/"initial_depth" (stages 1-2) never ran.
+    mark_done(record, "crop_mask", runtime_seconds=1.0, config_hash="hash1")
+    assert not should_skip_stage(record, "crop_mask", [output], "hash1", resume=True, overwrite=False)
 
 
 def test_should_skip_stage_false_when_overwrite_requested(tmp_path: Path):
@@ -74,16 +87,16 @@ def test_mark_done_invalidates_downstream_stage_statuses():
     manifest = Manifest()
     record = manifest.get_or_create(Path("field_a.jpg"))
 
-    for stage_name in ["validate", "super_resolution", "depth", "crop_mask"]:
+    for stage_name in ["validate", "initial_depth", "crop_mask", "ai_outpaint"]:
         mark_done(record, stage_name, runtime_seconds=1.0, config_hash="hash1")
-    assert record.stage("crop_mask").status == STATUS_DONE
+    assert record.stage("ai_outpaint").status == STATUS_DONE
 
-    # "super_resolution" recomputes (e.g. its own config changed) -> everything
-    # after it, including "crop_mask" which had nothing to do with that change,
-    # must be forced to re-run.
-    mark_done(record, "super_resolution", runtime_seconds=1.0, config_hash="hash2")
-    assert record.stage("depth").status == STATUS_PENDING
+    # "initial_depth" recomputes (e.g. its own config changed) -> everything after
+    # it, including "crop_mask"/"ai_outpaint" which had nothing to do with that
+    # change, must be forced to re-run.
+    mark_done(record, "initial_depth", runtime_seconds=1.0, config_hash="hash2")
     assert record.stage("crop_mask").status == STATUS_PENDING
+    assert record.stage("ai_outpaint").status == STATUS_PENDING
     # Stages BEFORE the recomputed one are untouched.
     assert record.stage("validate").status == STATUS_DONE
 
@@ -91,7 +104,7 @@ def test_mark_done_invalidates_downstream_stage_statuses():
 def test_failed_stage_marks_overall_record_failed():
     manifest = Manifest()
     record = manifest.get_or_create(Path("field_a.jpg"))
-    mark_failed(record, "depth", "boom")
+    mark_failed(record, "initial_depth", "boom")
     assert record.overall_status == STATUS_FAILED
     assert record.error == "boom"
 

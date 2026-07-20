@@ -1,8 +1,9 @@
-"""Stage 4 -- detect the crop/vegetation mask and its distance-transform
-*interior* (the part that's actually allowed to influence camera centering
-later on). Saves the mask itself plus a diagnostic panel showing the mask
-boundary, the selected interior, and (once Stage 7 computes it) the 2D
-projection of the calculated center.
+"""Stage 3 -- detect the crop/vegetation mask and its distance-transform
+*interior* on the ORIGINAL validated image (before any outpainting). Only
+this original, non-generated interior selection may ever influence camera
+X/Z, canopy-height, camera target, or virtual-camera framing -- Stage 6's
+re-segmentation of the AI-outpainted canvas is used for rendering/context
+only, never for that.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from typing import Callable, Optional
 import numpy as np
 
 from . import mark_done, mark_failed, mark_running, mark_skipped, should_skip_stage
+from .stage01_validate import ValidatedImage
 from ..config import PipelineConfig
 from ..geometry.crop_center import compute_interior_selector, draw_crop_center_diagnostic
 from ..io.image_io import atomic_write_image, atomic_write_npy
@@ -34,7 +36,7 @@ class CropMaskOutput:
 
 
 def run(
-    sr_rgb: np.ndarray,
+    validated: ValidatedImage,
     relative_path: Path,
     config: PipelineConfig,
     paths: PipelinePaths,
@@ -43,27 +45,30 @@ def run(
     logger: logging.Logger,
     external_mask_provider: Optional[Callable[[np.ndarray], Optional[np.ndarray]]] = None,
 ) -> Optional[CropMaskOutput]:
-    mask_visual_path = paths.stage_output_path("04_crop_mask", relative_path, ext_override=".png")
-    mask_npy_path = paths.sidecar_path("04_crop_mask", relative_path, ".mask.npy")
-    diagnostic_path = paths.sidecar_path("04_crop_mask", relative_path, ".center_diagnostic.jpg")
+    mask_visual_path = paths.stage_output_path("03_crop_mask", relative_path, ext_override=".png")
+    mask_npy_path = paths.sidecar_path("03_crop_mask", relative_path, ".mask.npy")
+    interior_visual_path = paths.stage_output_path("03_crop_interior", relative_path, ext_override=".png")
+    interior_npy_path = paths.sidecar_path("03_crop_interior", relative_path, ".interior.npy")
+    diagnostic_path = paths.sidecar_path("03_crop_interior", relative_path, ".center_diagnostic.jpg")
 
-    if should_skip_stage(record, STAGE_NAME, [mask_visual_path, mask_npy_path], config_hash, config.RESUME, config.OVERWRITE):
+    outputs = [mask_visual_path, mask_npy_path, interior_visual_path, interior_npy_path]
+    if should_skip_stage(record, STAGE_NAME, outputs, config_hash, config.RESUME, config.OVERWRITE):
         mark_skipped(record, STAGE_NAME)
         logger.info("[crop_mask] %s -- skipped (resumed)", relative_path)
-        mask = np.load(mask_npy_path)
-        interior = compute_interior_selector(mask, config.CROP_INTERIOR_QUANTILE)
-        return CropMaskOutput(mask=mask, interior_selector=interior, used_fallback=False)
+        return CropMaskOutput(mask=np.load(mask_npy_path), interior_selector=np.load(interior_npy_path), used_fallback=False)
 
     mark_running(record, STAGE_NAME)
     start = time.perf_counter()
     try:
-        mask, used_fallback = get_or_estimate_crop_mask(sr_rgb, external_mask_provider)
+        mask, used_fallback = get_or_estimate_crop_mask(validated.rgb, external_mask_provider)
         interior = compute_interior_selector(mask, config.CROP_INTERIOR_QUANTILE)
 
         atomic_write_image((mask.astype(np.uint8) * 255), mask_visual_path)
         atomic_write_npy(mask, mask_npy_path)
+        atomic_write_image((interior.astype(np.uint8) * 255), interior_visual_path)
+        atomic_write_npy(interior, interior_npy_path)
         if config.SAVE_DEBUG_VISUALIZATION:
-            diagnostic = draw_crop_center_diagnostic(sr_rgb, mask, interior, center_pixel=None)
+            diagnostic = draw_crop_center_diagnostic(validated.rgb, mask, interior, center_pixel=None)
             atomic_write_image(diagnostic, diagnostic_path)
 
         record.crop_mask_percentage = float(mask.mean() * 100)

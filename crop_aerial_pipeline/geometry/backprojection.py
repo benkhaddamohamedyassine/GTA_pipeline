@@ -28,9 +28,11 @@ def depth_norm_to_metric(depth_norm: np.ndarray, near_m: float = NEAR_M, far_m: 
 class BackprojectionResult:
     points: np.ndarray  # (N, 3) float64, +X right, +Y up, +Z forward
     colors: np.ndarray  # (N, 3) float64 in [0, 1]
-    pixel_coords: np.ndarray  # (N, 2) int64 [u, v] in the (padded) source image
-    is_original: np.ndarray  # (N,) bool -- True for real/super-resolved pixels, False for synthesized extension
-    in_crop_mask: np.ndarray  # (N,) bool -- True if the source pixel is inside the (possibly extended) crop mask
+    pixel_coords: np.ndarray  # (N, 2) int64 [u, v] in the (extended) source image
+    is_original: np.ndarray  # (N,) bool -- True for real (Stage 4-provenance) pixels, False for AI-generated
+    in_crop_mask: np.ndarray  # (N,) bool -- True if the source pixel is inside the (extended) crop mask
+    in_crop_interior: np.ndarray  # (N,) bool -- True only for the ORIGINAL image's crop-interior selection
+    is_finite: np.ndarray  # (N,) bool -- True if the point's XYZ are all finite (defensive; NaN/inf depth is rejected upstream too)
 
 
 def backproject(
@@ -40,22 +42,31 @@ def backproject(
     stride: int,
     origin_mask: Optional[np.ndarray] = None,
     crop_mask: Optional[np.ndarray] = None,
+    interior_mask: Optional[np.ndarray] = None,
 ) -> BackprojectionResult:
     """Vectorized back-projection. Camera convention: origin at the source
     camera, +X right, +Y up, +Z forward (increasing with depth).
 
-    ``origin_mask``: boolean HxW, True where the source pixel is real (or
-    super-resolved-but-real) content, False where it was synthesized by Stage
-    5's source extension. Defaults to all-True (nothing synthesized).
+    ``origin_mask``: boolean HxW, True where the source pixel is real (Stage
+    4 provenance), False where it was AI-outpainted. Defaults to all-True.
 
-    ``crop_mask``: boolean HxW crop/vegetation mask (already extended into any
-    synthesized region by Stage 5, if applicable). Defaults to all-True.
+    ``crop_mask``: boolean HxW crop/vegetation mask (Stage 6's extended
+    mask, if applicable). Defaults to all-True.
+
+    ``interior_mask``: boolean HxW, True only for pixels inside the
+    ORIGINAL image's crop-interior selection (Stage 3), embedded at the
+    correct offset within the extended canvas and constant-zero elsewhere --
+    this is what Stage 8/9 gate camera placement/framing on, and it must
+    never include any AI-generated pixel. Defaults to all-False (no pixels
+    considered interior) if not provided.
     """
     h, w = depth_m.shape
     if origin_mask is None:
         origin_mask = np.ones((h, w), dtype=bool)
     if crop_mask is None:
         crop_mask = np.ones((h, w), dtype=bool)
+    if interior_mask is None:
+        interior_mask = np.zeros((h, w), dtype=bool)
 
     fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
     us, vs = np.meshgrid(np.arange(0, w, stride), np.arange(0, h, stride))
@@ -70,6 +81,8 @@ def backproject(
     pixel_coords = np.stack([us, vs], axis=-1).reshape(-1, 2).astype(np.int64)
     is_original = origin_mask[vs, us].reshape(-1)
     in_crop_mask = crop_mask[vs, us].reshape(-1)
+    in_crop_interior = interior_mask[vs, us].reshape(-1)
+    is_finite = np.isfinite(points).all(axis=1)
 
     return BackprojectionResult(
         points=points,
@@ -77,6 +90,8 @@ def backproject(
         pixel_coords=pixel_coords,
         is_original=is_original,
         in_crop_mask=in_crop_mask,
+        in_crop_interior=in_crop_interior,
+        is_finite=is_finite,
     )
 
 
